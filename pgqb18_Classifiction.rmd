@@ -1,0 +1,400 @@
+---
+---
+---
+
+```{r message=FALSE, warning=FALSE}
+library("tidyverse")
+library("data.table")
+library("mlr3verse")
+library("rsample")
+library(dplyr)
+library(caret)
+library("mlr3verse")
+library("paradox")
+library("keras")
+library("recipes")
+library(ggpubr)
+library(yardstick)
+library(pROC)
+```
+
+# 1. Problem Description
+
+-   Aim is to predict if a customer will "churn" (leave the phone company for a different contract)
+
+```{r}
+data<-read.csv("https://www.louisaslett.com/Courses/MISCADA/telecom.csv",stringsAsFactors = T)
+
+summary(data)
+
+skimr::skim(data)
+
+data<-na.omit(data)
+
+```
+
+It can be found that only the TotalCharges variable has 10 missing values, so the missing data are removed.
+
+```{r}
+my_palette <- c("#E69F00", "#56B4E9")
+numeric_vars <- c("tenure", "MonthlyCharges", "TotalCharges")
+
+# Create boxplots for numeric variables with Churn and add t-test p-values
+for (var in numeric_vars) {
+  p <- ggplot(data, aes(x = Churn, y = .data[[var]], fill = Churn)) +
+    geom_boxplot() +
+    labs(title = paste("Boxplot of", var, "by Churn"),
+         x = "Churn",
+         y = var)  +
+    stat_compare_means(method = "t.test", label = "p.format")+ scale_fill_manual(values = my_palette)
+  
+  print(p)
+}
+
+# categorical variables
+cat_vars <- c("gender", "SeniorCitizen", "Partner", "Dependents", "PhoneService", "MultipleLines",
+              "InternetService", "OnlineSecurity", "OnlineBackup", "DeviceProtection", "TechSupport",
+              "StreamingTV", "StreamingMovies", "Contract", "PaperlessBilling", "PaymentMethod")
+
+# Create proportion bar plots for categorical variables with Churn and add percentages
+for (var in cat_vars) {
+  p <- ggplot(data, aes(x = .data[[var]], fill = Churn)) +
+    geom_bar(position = "fill") +
+    labs(title = paste("Proportion Bar Plot of", var, "by Churn"),
+         x = var,
+         y = "Proportion") +
+    theme_minimal() +
+    scale_y_continuous(labels = scales::percent) +
+    geom_text(aes(label = scales::percent(..count.. / sum(..count..))),
+              stat = "count",
+              position = position_fill(vjust = 0.5),
+              color = "white")
+  print(p)
+}
+
+  
+```
+
+Through the analysis of the relationship between numerical and categorical variables and customer Churn, we find that except for the proportion difference of gender, PhoneService and MultipleLines, all the other variables show a significant association with customer churn.
+
+For the numerical variables, tenure, MonthlyCharges, and TotalCharges have a significant relationship with customer churn. This indicates that the customer's service duration, monthly fee level and total fee may be important factors influencing the customer's decision whether to continue using the service.
+
+In terms of the categorical variables, most of the categorical variables are significantly associated with customer churn. These findings suggest that different customer characteristics, service mix, and billing arrangements may have an impact on customer churn decisions.
+
+# 2.Model fitting
+
+### Machine learning
+
+```{r}
+
+set.seed(212)
+
+# Function to initialize split data
+split_data <- function(data, split_ratio = 0.75) {
+  initial_split <- initial_split(data, prop = split_ratio)
+  list(
+    train = training(initial_split),
+    test = testing(initial_split)
+  )
+}
+
+# Functions to train and evaluate models
+train_evaluate_model <- function(model, task, train_data, test_data) {
+  model$train(task, row_ids = as.numeric(rownames(train_data)))
+  pred <- model$predict(task, row_ids = as.numeric(rownames(test_data)))
+  confusion_matrix <- pred$confusion
+  accuracy <- yardstick::accuracy_vec(factor(test_data$Churn, levels = c("Yes", "No")), pred$response)
+  roc_auc <- yardstick::roc_auc_vec(factor(test_data$Churn, levels = c("Yes", "No")), c(pred$prob[,1]))
+  list(confusion_matrix = confusion_matrix, accuracy = accuracy, roc_auc = roc_auc)
+}
+
+data_split <- split_data(data)
+train_test_split <- split_data(data_split$test, 0.5)
+
+models <- list(
+  "Baseline" = lrn("classif.featureless", predict_type = "prob"),
+  "Random Forest" = lrn("classif.ranger", predict_type = "prob"),
+  "Logistic Regression" = lrn("classif.log_reg", predict_type = "prob"),
+  "K-Nearest Neighbors" = lrn("classif.kknn", predict_type = "prob"),
+  "Naive Bayes" = lrn("classif.naive_bayes", predict_type = "prob")
+)
+
+# Create classification tasks
+churn_task <- TaskClassif$new(id = "churn", backend = data, target = "Churn", positive = "Yes")
+
+# Iterate over and evaluate each model
+results <- list()
+for (model_name in names(models)) {
+  model_results <- train_evaluate_model(models[[model_name]], churn_task, train_test_split$train, train_test_split$test)
+  cat(sprintf("\n%s Model:\n", model_name))
+  print(model_results$confusion_matrix)
+  print(model_results$accuracy)
+  print(model_results$roc_auc)
+  results[[model_name]] <- model_results
+}
+
+```
+
+1.  Baseline model: This model predicts "No" for all samples with 72.96% accuracy. However, its ROC AUC value is 0.5, indicating that the model’s predictive power is comparable to random guessing. This indicates that the baseline model performs poorly at predicting churn.
+2.  Random forest model: The accuracy of this model is 63.72%, which is lower than the baseline model. The ROC AUC value is 0.5360, indicating that the model has average predictive ability in distinguishing churn customers from non-churn customers.
+3.  Logistic regression model: The accuracy of this model is 62.38%, which is slightly lower than the random forest model. The ROC AUC value is 0.5204, which is also low, indicating that the logistic regression model performs only moderately well in predicting churn.
+4.  K-Nearest Neighbor Model: The accuracy of this model is 62.25%, which is similar to the baseline model. The ROC AUC value is 0.5473.
+5.  Naive Bayes model: The accuracy of this model is 55.42%, which is lower than all models. The ROC AUC value is 0.5168, indicating that this model has the worst performance in predicting customer churn.
+
+### Deep learning
+
+```{r}
+
+# Set seeds for reproducibility
+set.seed(212)
+tensorflow::set_random_seed(212)
+
+# Split the dataset into training and testing sets, then further split the testing set into validation and test sets
+split <- initial_split(data)
+train_data <- training(split)
+split2 <- initial_split(testing(split), prop = 0.5)
+validate_data <- training(split2)
+test_data <- testing(split2)
+
+# Define and prepare data preprocessing steps
+recipe_obj <- recipe(Churn ~ ., data = data) %>%
+  step_impute_mean(all_numeric()) %>%
+  step_center(all_numeric()) %>%
+  step_scale(all_numeric()) %>%
+  step_dummy(all_nominal(), one_hot = TRUE) %>%
+  prep(training = train_data)
+
+# Apply preprocessing steps
+train_processed <- bake(recipe_obj, new_data = train_data)
+validate_processed <- bake(recipe_obj, new_data = validate_data)
+test_processed <- bake(recipe_obj, new_data = test_data)
+
+# Prepare model inputs
+train_x <- as.matrix(select(train_processed, -Churn_Yes, -Churn_No))
+validate_x <- as.matrix(select(validate_processed, -Churn_Yes, -Churn_No))
+test_x <- as.matrix(select(test_processed, -Churn_Yes, -Churn_No))
+
+# Prepare model outputs (labels), ensuring they are one-dimensional arrays
+train_y <- as.matrix(select(train_processed, Churn_Yes))[, 1]
+validate_y <- as.matrix(select(validate_processed, Churn_Yes))[, 1]
+test_y <- as.matrix(select(test_processed, Churn_Yes))[, 1]
+
+# Build a deep neural network model
+deep_model <- keras_model_sequential() %>%
+  layer_dense(units = 64, activation = "relu", input_shape = c(ncol(train_x))) %>%
+  layer_dense(units = 32, activation = "relu") %>%
+  layer_dense(units = 1, activation = "sigmoid")
+
+# Compile the model
+deep_model %>% compile(
+  loss = "binary_crossentropy",
+  optimizer = optimizer_adam(learning_rate = 0.001),
+  metrics = c("accuracy")
+)
+
+# Train the model
+history <- deep_model %>% fit(
+  train_x, train_y,
+  epochs = 100, batch_size = 32,
+  validation_data = list(validate_x, validate_y),
+  verbose = 0
+)
+
+# Obtain probability predictions on the test set
+pred_test_prob <- predict(deep_model, test_x)
+
+# Generate classification predictions (0 or 1)
+pred_test_class <- ifelse(pred_test_prob > 0.5, 1, 0)
+
+# Calculate and print accuracy on the test set
+acc <- mean(pred_test_class == test_y)
+cat("Accuracy on Test Set:", acc, "\n")
+
+# Calculate and print AUC value on the test set
+roc_result <- roc(response = test_y, predictor = as.numeric(pred_test_prob))
+auc_value <- auc(roc_result)
+cat("AUC on Test Set:", auc_value, "\n")
+
+# Print the confusion matrix
+confusion_matrix <- table(Predicted = pred_test_class, Actual = test_y)
+print(confusion_matrix)
+
+# Optional: Print the accuracy and loss changes during training
+plot(history)
+
+
+
+```
+
+1.  Accuracy: The accuracy of deep neural network model is 72.95%
+2.  ROC AUC value: The ROC AUC value of the deep neural network model was 0.7345, Deep neural network models are more accurate at predicting customer churn than other models. This shows that despite the powerful representational power of the deep neural network model, it significantly outperforms other traditional machine learning models in this specific churn prediction task. The performance of deep neural network models may be affected by multiple factors, such as network architecture, hyperparameter settings, and data preprocessing. Through further tuning and optimization, the performance of deep neural network models may be improved.
+
+# 3.Model Improvements
+
+```{r}
+churn_task <- TaskClassif$new(id = "churn", backend = data, target = "Churn", positive = "Yes")
+
+lrn_ranger <- lrn("classif.ranger", predict_type = "prob")
+
+param_set <- ParamSet$new(list(
+  ParamInt$new("mtry", lower = 1, upper = ncol(data) - 1),
+  ParamInt$new("min.node.size", lower = 1, upper = 10),
+  ParamInt$new("num.trees", lower = 50, upper = 500)
+))
+
+resampling <- rsmp("cv", folds = 5)
+
+
+tuner <- tnr("random_search")
+
+lrn_ranger_tuned <- AutoTuner$new(   learner = lrn_ranger,
+  resampling = resampling, 
+  measure = msr("classif.auc"), 
+  search_space = param_set,
+  terminator = trm("evals", n_evals = 50),
+  tuner = tuner )
+
+
+lrn_ranger_tuned$train(churn_task, row_ids = as.numeric(rownames(train_data)))
+
+pred_test_ranger_tuned <- lrn_ranger_tuned$predict(churn_task, as.numeric(rownames(test_data)))
+
+# Evaluate the tuned Random Forest model
+table_ranger_tuned <- pred_test_ranger_tuned$confusion
+accuracy_ranger_tuned <- yardstick::accuracy_vec(factor(test_data$Churn, levels = c("Yes","No")), pred_test_ranger_tuned$response)
+roc_auc_ranger_tuned <- yardstick::roc_auc_vec(factor(test_data$Churn, levels = c("Yes","No")), c(pred_test_ranger_tuned$prob[,1]))
+
+print("Tuned Random Forest Model:")
+print(table_ranger_tuned)
+print(accuracy_ranger_tuned)
+print(roc_auc_ranger_tuned)
+```
+
+```{r}
+tensorflow::set_random_seed(212)
+
+# Construct the deep neural network architecture with more layers
+deep_model_deep <- keras_model_sequential() %>%
+  layer_dense(units = 128, activation = "relu", input_shape = c(ncol(train_x))) %>%
+  layer_dropout(rate = 0.2) %>%
+  layer_dense(units = 64, activation = "relu") %>%
+  layer_dropout(rate = 0.2) %>%
+  layer_dense(units = 64, activation = "relu") %>%
+  layer_dropout(rate = 0.2) %>%
+  layer_dense(units = 32, activation = "relu") %>%
+  layer_dropout(rate = 0.2) %>%
+  layer_dense(units = 1, activation = "sigmoid")
+
+deep_model_deep
+
+# Compile the model
+deep_model_deep %>% compile(
+  loss = "binary_crossentropy",
+  optimizer = optimizer_adam(learning_rate = 0.001),
+  metrics = c("accuracy")
+)
+
+# Train the model
+deep_model_deep %>% fit(train_x, train_y,
+  epochs = 100, batch_size = 32,
+  validation_data = list(validate_x, validate_y), verbose = 0
+)
+
+# Get the probability predictions on the test set
+pred_test_prob_deep <- deep_model_deep %>% predict(test_x)
+
+# Get the predicted classes (assuming 0.5 cutoff)
+pred_test_class_deep <- deep_model_deep %>% predict(test_x) %>% `>`(0.5) %>% as.integer()
+
+# Evaluate the deep learning model with more layers
+table_deep_deep <- table(pred_test_class_deep, test_y)
+acc_deep_deep <- yardstick::accuracy_vec(factor(test_y, levels =c(1,0)),
+                        factor(pred_test_class_deep, levels = c(1,0)))
+auc_deep_deep <- yardstick::roc_auc_vec(factor(test_y, levels = c(1,0)),
+                       c(pred_test_prob_deep))
+
+
+print("Deep Learning Model with More Layers:")
+print(table_deep_deep)
+print(acc_deep_deep)
+print(auc_deep_deep)
+```
+
+Through comparison, it can be found that the accuracy and AUC of Ranger algorithm after parameter adjustment have been improved. The accuracy of Ranger algorithm after parameter adjustment reaches 0.7523427 and the AUC reaches 0.7509492. This shows that the performance of the model can be further improved by adjusting the parameters of the algorithm. Parameter tuning is a very important step. By selecting appropriate parameters, the model can be better adapted to the data set, so as to obtain higher accuracy and AUC. But neither of these two improved models results as well as logistic regression.
+
+# 4.Performance report
+
+### Calibration
+
+```{r}
+data_baseline <- data.frame(prob = pred_test_baseline$prob[,1], truth = test$Churn)
+data_ranger <- data.frame(prob = pred_test_ranger$prob[,1], truth = test$Churn)
+data_ranger_tuned <- data.frame(prob = pred_test_ranger_tuned$prob[,1], truth = test$Churn)
+data_log_reg <- data.frame(prob = pred_test_log_reg$prob[,1], truth = test$Churn)
+data_kknn <- data.frame(prob = pred_test_kknn$prob[,1], truth = test$Churn)
+data_naive_bayes <- data.frame(prob = pred_test_naive_bayes$prob[,1], truth = test$Churn)
+data_dl <- data.frame(prob =pred_test_prob_deep , truth = test$Churn)
+
+calib_baseline <- calibration(truth ~ prob, data = data_baseline, bins = 10)
+calib_ranger <- calibration(truth ~ prob, data = data_ranger, bins = 10)
+calib_ranger_tuned <- calibration(truth ~ prob, data = data_ranger_tuned, bins = 10)
+calib_log_reg <- calibration(truth ~ prob, data = data_log_reg, bins = 10)
+calib_kknn <- calibration(truth ~ prob, data = data_kknn, bins = 10)
+calib_naive_bayes <- calibration(truth ~ prob, data = data_naive_bayes, bins = 10)
+calib_dl <- calibration(truth ~ prob, data = data_dl, bins = 10)
+
+plot(calib_baseline, main = "Baseline Calibration")
+plot(calib_ranger, main = "Random Forest Calibration")
+plot(calib_ranger_tuned, main = "Tuned Random Forest Calibration")
+plot(calib_log_reg, main = "Logistic Regression Calibration")
+plot(calib_kknn, main = "K-Nearest Neighbors Calibration")
+plot(calib_naive_bayes, main = "Naive Bayes Calibration")
+plot(calib_dl, main = "Deep Learning Calibration")
+```
+
+### Positive Rates
+
+```{r}
+calculate_sensitivity_specificity <- function(y_true, y_pred_prob, threshold = 0.5) {
+  y_pred <- ifelse(y_pred_prob > threshold, "Yes", "No")
+  
+  TP <- sum((y_true == "Yes") & (y_pred == "Yes"))
+  FP <- sum((y_true == "No") & (y_pred == "Yes"))
+  TN <- sum((y_true == "No") & (y_pred == "No"))
+  FN <- sum((y_true == "Yes") & (y_pred == "No"))
+  
+  sensitivity <- TP / (TP + FN)
+  specificity <- TN / (TN + FP)
+  
+  return(list(sensitivity = sensitivity, specificity = specificity))
+}
+
+results_baseline <- calculate_sensitivity_specificity(test$Churn, pred_test_baseline$prob[,1])
+results_ranger <- calculate_sensitivity_specificity(test$Churn, pred_test_ranger$prob[,1])
+results_ranger_tuned <- calculate_sensitivity_specificity(test$Churn, pred_test_ranger_tuned$prob[,1])
+results_log_reg <- calculate_sensitivity_specificity(test$Churn, pred_test_log_reg$prob[,1])
+results_kknn <- calculate_sensitivity_specificity(test$Churn, pred_test_kknn$prob[,1])
+results_naive_bayes <- calculate_sensitivity_specificity(test$Churn, pred_test_naive_bayes$prob[,1])
+results_dl <- calculate_sensitivity_specificity(test$Churn, pred_test_prob_deep)
+
+model_names <- c("Baseline", "Random Forest", "Tuned Random Forest", "Logistic Regression", "K-Nearest Neighbors", "Naive Bayes", "Deep Learning")
+results_list <- list(results_baseline, results_ranger, results_ranger_tuned, results_log_reg, results_kknn, results_naive_bayes, results_dl)
+
+results_df <- data.frame(
+  Model = model_names,
+  Sensitivity = sapply(results_list, function(x) x$sensitivity),
+  Specificity = sapply(results_list, function(x) x$specificity)
+)
+print(results_df)
+
+results_df_long <- reshape2::melt(results_df, id.vars = "Model", variable.name = "Metric", value.name = "Value")
+
+ggplot(results_df_long, aes(x = Model, y = Value, fill = Metric)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  labs(title = "Sensitivity and Specificity of Different Models",
+       x = "Model",
+       y = "Value") +
+  scale_fill_manual(values = c("Sensitivity" = "dodgerblue", "Specificity" = "darkorange"))  +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+```
